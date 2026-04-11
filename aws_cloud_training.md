@@ -25,6 +25,10 @@
 18. [Cost Management — Don't Get Surprised by Your Bill](#18-cost-management--dont-get-surprised-by-your-bill)
 19. [Real-World Project: Deploy a Python Web App on AWS](#19-real-world-project-deploy-a-python-web-app-on-aws)
 20. [Next Steps & What to Learn After This](#20-next-steps--what-to-learn-after-this)
+21. [CloudFront CDN — Deep Dive](#21-cloudfront-cdn--deep-dive)
+22. [ECS Fargate — Serverless Containers Explained](#22-ecs-fargate--serverless-containers-explained)
+23. [App Runner — Simplest Container Deployment](#23-app-runner--simplest-container-deployment)
+24. [Production Deployment Cheat Sheet — When to Use What](#24-production-deployment-cheat-sheet--when-to-use-what)
 
 ---
 
@@ -1310,6 +1314,401 @@ Congratulations! You now have a solid foundation in AWS as a developer. Here is 
 | **CodeDeploy** | DevOps | Automated deployments |
 | **Secrets Manager** | Security | Store and rotate secrets |
 | **WAF** | Security | Web Application Firewall |
+| **App Runner** | Containers | Simplest container deployment |
+| **EKS** | Containers | Kubernetes on AWS |
+
+---
+
+## 21. CloudFront CDN — Deep Dive
+
+### The Problem It Solves
+
+Your React app's files (HTML, JS, CSS) live in one S3 bucket in, say, `us-east-1` (Virginia, USA). When a user in Mumbai opens your site, their browser has to travel all the way to Virginia to download those files. That is slow.
+
+CloudFront fixes this by putting cached copies of your files **close to every user in the world**.
+
+### What CloudFront Does
+
+CloudFront has **servers (called Edge Locations) in 400+ cities worldwide** — Mumbai, London, Tokyo, São Paulo, and more. The first time someone in Mumbai visits your site, CloudFront fetches the files from your S3 bucket (the origin) and stores a copy at the nearest edge location. Every user after that in Mumbai gets the files from that local city — not Virginia.
+
+```
+Without CloudFront:
+  User in Mumbai → Virginia S3 bucket     (high latency — slow)
+
+With CloudFront:
+  User in Mumbai → Mumbai Edge Location   (fast — cached copy)
+  User in London → London Edge Location   (fast — cached copy)
+  User in Tokyo  → Tokyo Edge Location    (fast — cached copy)
+```
+
+### Key Concepts
+
+| Concept | What It Means |
+|---|---|
+| **Origin** | Where CloudFront fetches the original files from. Usually your S3 bucket or a backend server. |
+| **Edge Location** | A CloudFront server in a city near the user. Caches and serves your content locally. |
+| **Distribution** | A CloudFront configuration that ties an origin to all edge locations. You create one per app. |
+| **Cache Invalidation** | Tells all edge locations to delete their cached copy and fetch fresh files from the origin. Run this after every deployment. |
+| **TTL (Time To Live)** | How long edge locations keep the cached copy before checking the origin for a newer version. |
+
+### How Deployment Works with S3 + CloudFront
+
+```
+1. npm run build  →  creates dist/ folder (HTML, JS, CSS)
+         ↓
+2. aws s3 sync dist/ s3://your-bucket  →  uploads new files to S3
+         ↓
+3. aws cloudfront create-invalidation  →  clears old cached files at all edge locations
+         ↓
+4. Next user request fetches fresh files from S3  →  caches at edge locations again
+         ↓
+5. All users now get the new version from their nearest city
+```
+
+### Extra Benefits
+
+- **Free HTTPS** — CloudFront provides a free SSL certificate via AWS Certificate Manager (ACM). No manual SSL setup.
+- **DDoS protection** — AWS Shield Standard is automatically included.
+- **Cost savings at scale** — Edge caching reduces the number of direct requests to S3, which lowers your S3 costs.
+
+### CloudFront vs. Serving Directly from S3
+
+| | S3 Direct | S3 + CloudFront |
+|---|---|---|
+| **Latency for global users** | High | Low |
+| **HTTPS** | Complicated to configure | Automatic |
+| **Cost at high traffic** | Higher | Lower (caching reduces S3 reads) |
+| **Custom domain support** | Limited | Full support |
+
+> **Rule of thumb:** Always put CloudFront in front of S3 for any production app. It is faster for users everywhere and cheaper at scale.
+
+### Simple Analogy
+**S3** is the central warehouse. **CloudFront** is a network of local stores. Your users shop at the nearest local store instead of ordering from the central warehouse every single time.
+
+---
+
+## 22. ECS Fargate — Serverless Containers Explained
+
+### Start with ECS
+
+ECS (Elastic Container Service) is AWS's system for **running Docker containers**. You give it a Docker image, tell it "run this container with 1 vCPU and 512 MB RAM", and it runs it and keeps it running.
+
+### The Problem with Raw EC2
+
+When you run containers on EC2, you are responsible for the **virtual machine underneath** the containers too:
+- Keep the OS patched and updated
+- Install and configure Docker
+- Monitor disk space and server health
+- Handle crashes and restarts manually
+- Scale by provisioning more EC2 instances yourself
+
+You are managing two things at once — the server AND the container.
+
+### What Fargate Changes
+
+Fargate is ECS **without any server to manage**. You only think about your container. AWS handles the underlying machine completely invisibly.
+
+```
+ECS on EC2:                          ECS on Fargate:
+  You manage:                          You manage:
+  - EC2 instance (OS, disk, Docker)    - Your container only
+  - Container on top of it
+                                       AWS manages everything else
+                                       invisibly underneath
+```
+
+### Key Concepts
+
+| Concept | What It Means |
+|---|---|
+| **Task Definition** | A blueprint for your container — image URL, CPU, RAM, port, and environment variables |
+| **Task** | A single running instance of a Task Definition — essentially one live container |
+| **Service** | Ensures a specific number of tasks are always running. If one crashes, ECS automatically starts a replacement |
+| **Cluster** | A logical group that holds your services and tasks |
+| **Load Balancer** | Sits in front of your service — distributes traffic across multiple running tasks and gives you a stable public URL |
+
+### How to Think About It
+
+```
+You define:
+  Task Definition: "Run this ECR image, port 8000, 0.5 vCPU, 1 GB RAM"
+
+You create:
+  Service: "Keep 2 copies of this task running at all times"
+
+Fargate does:
+  - Finds spare capacity in AWS's infrastructure
+  - Starts your containers on it
+  - Monitors container health
+  - Restarts containers that crash
+  - Scales up/down based on your rules
+```
+
+### Fargate Pricing
+
+You pay for the exact vCPU and memory your containers consume, billed per second. No idle server costs. Run 2 tasks × 0.5 vCPU × 1 GB RAM and you pay exactly for that, nothing more.
+
+### When to Use Fargate
+
+- Standard REST APIs and backend services that run 24/7
+- Microservices in a growing application
+- Teams without a dedicated DevOps or infrastructure engineer
+- Variable traffic workloads where auto-scaling saves cost
+- The vast majority of production containerized apps on AWS use Fargate
+
+### Simple Analogy
+**EC2** is renting an apartment — you manage everything inside (furniture, cleaning, repairs, utilities). **Fargate** is staying in a hotel — you just use the room, and the hotel handles all maintenance, cleaning, and security invisibly.
+
+---
+
+## 23. App Runner — Simplest Container Deployment
+
+### The Problem Fargate Still Has
+
+Even with Fargate, you configure many pieces before your container is publicly live:
+- Task Definition (CPU, RAM, port, environment variables)
+- ECS Cluster
+- ECS Service
+- Application Load Balancer
+- Target Groups and Listener Rules
+- Security Groups and IAM roles for the task
+
+That is typically 15–20 setup steps before you get a public URL.
+
+### What App Runner Does
+
+App Runner is the **simplest way to deploy a container on AWS**. You point it at an ECR image and answer three questions:
+
+1. Which image?
+2. What port does it listen on?
+3. How much CPU and RAM?
+
+That is it. App Runner creates everything else automatically.
+
+```
+App Runner setup:
+  Source:  123456789.dkr.ecr.us-east-1.amazonaws.com/gpt-app:latest
+  Port:    8000
+  CPU:     1 vCPU
+  RAM:     2 GB
+
+  → Done. Here is your URL:
+    https://abc123xyz.us-east-1.awsapprunner.com
+```
+
+### What App Runner Handles Automatically
+
+- Creates a load balancer and HTTPS endpoint (no manual configuration)
+- Auto-scales up when traffic increases
+- Scales down to near-zero when idle (saves cost)
+- Restarts containers that crash
+- Can watch ECR for new image pushes and redeploy automatically
+- Free TLS/SSL certificate included
+
+### App Runner vs. Fargate
+
+| | App Runner | ECS Fargate |
+|---|---|---|
+| **Setup steps** | ~5 | ~20 |
+| **Load balancer** | Auto-created | You configure it |
+| **Auto-scaling** | Fully automatic | You define scaling rules |
+| **Private VPC networking** | Optional, limited | Full control |
+| **Cost at scale** | Slightly higher | Lower |
+| **Best for** | Quick deploys, small teams | Production workloads needing full control |
+
+### When to Use App Runner
+
+- Internal tools, admin dashboards, or side projects needing a real HTTPS URL
+- MVPs where speed of deployment matters more than cost optimization
+- Teams with no DevOps engineer — anyone can deploy a container in minutes
+- Low to medium traffic APIs
+
+### When NOT to Use App Runner
+
+- High-traffic production APIs where cost efficiency at scale matters
+- Apps that need deep private VPC networking (talking to RDS in a private subnet, etc.)
+- When you need fine-grained control over auto-scaling behavior
+
+### Simple Analogy
+**Fargate** is a fully customizable hotel suite — you configure the room layout, temperature, lighting, and services yourself. **App Runner** is an Airbnb with automatic check-in — you just show up, everything is already set up for you.
+
+---
+
+## 24. Production Deployment Cheat Sheet — When to Use What
+
+As a developer, one of the most important decisions is: **where do I actually run my application in production?**
+
+This section is a complete reference for every real option, from simplest to most complex.
+
+### The Spectrum
+
+```
+Least control, simplest setup                    Most control, most complex
+         │                                                   │
+    App Runner → ECS Fargate → ECS on EC2 → EKS (K8s) → Raw EC2
+         │                                                   │
+   Small apps                                    Large, complex systems
+```
+
+---
+
+### Option 1 — Raw EC2
+
+**What it is:** A virtual machine. You install Docker yourself and run containers manually.
+
+**Used in production?** Rarely for new projects. Seen in:
+- Legacy systems built before containers were standard
+- Workloads with specific low-level OS or GPU requirements
+
+**Skip it for:** Web APIs, microservices, anything modern.
+
+---
+
+### Option 2 — ECS on EC2 (EC2 Launch Type)
+
+**What it is:** ECS orchestrates your containers, but they run on EC2 instances that you provision and maintain.
+
+**Used in production?** Yes, in specific cases:
+- Need GPU (Fargate does not support GPU)
+- Very large containers (Fargate max is 16 vCPU / 120 GB RAM)
+- Extreme cost optimization at very high volume using EC2 Reserved Instances
+
+**Skip it for:** Standard web APIs and services.
+
+---
+
+### Option 3 — Elastic Beanstalk
+
+**What it is:** A PaaS (Platform as a Service) from AWS. You give it your application code or a Docker image and it automatically provisions EC2 instances, a load balancer, auto-scaling, and health monitoring for you. It supports both traditional code deploys (Python, Node.js, Java, Ruby, PHP, Go) and Docker (single container or multi-container via Docker Compose).
+
+**Used in production?** Yes, and more common than people think — especially in teams that want EC2-level access without manually wiring all the infrastructure pieces.
+
+**Use it when:**
+- You are deploying a traditional web app or REST API **without Docker** (plain Python/Node.js code) — this is its strongest use case
+- You want EC2-like control (you can SSH into the underlying instance, tune the OS) but without manually setting up a load balancer and auto-scaling group
+- You are already using Docker but also want the ability to SSH into the server for debugging (unlike Fargate/App Runner where the underlying server is completely hidden)
+- You want a quick production-grade setup with minimal AWS infrastructure knowledge
+- You are migrating an existing app to AWS and want the least-friction path
+
+**Do not use it when:**
+- You want a fully serverless setup where the underlying EC2 is completely hidden — use Fargate or App Runner instead
+- You need very fine-grained container orchestration across many services — use ECS Fargate or EKS
+
+**The key difference from Fargate/App Runner:**
+Beanstalk runs your containers (or code) **on EC2 instances that you can see and SSH into**. Fargate and App Runner are truly serverless — the underlying server is invisible. Choose Beanstalk when EC2-level access matters; choose Fargate/App Runner when you want zero server management.
+
+**Elastic Beanstalk vs. the others:**
+
+| | Elastic Beanstalk | App Runner | ECS Fargate |
+|---|---|---|---|
+| **Uses Docker?** | Yes (optional — also supports plain code) | Required | Required |
+| **Underlying servers** | EC2 (you can SSH in) | Hidden completely | Hidden completely |
+| **Setup complexity** | Low | Very low | Medium |
+| **Infrastructure control** | Medium | Low | High |
+| **Best for** | Quick deploys, SSH access needed, or no-Docker code | Quick container deploys, no infra management | Production containers, full control |
+
+> **Simple analogy:** Elastic Beanstalk is a **serviced apartment** — it comes fully furnished (EC2, load balancer, auto-scaling) but you can still go in and rearrange the furniture (SSH in, change OS settings). App Runner and Fargate are **hotels** — everything is managed for you and you cannot touch the underlying infrastructure at all.
+
+---
+
+### Option 4 — ECS Fargate
+
+**What it is:** Serverless containers. You define the container, AWS manages everything else.
+
+**Used in production?** **Yes — the most common choice for containerized apps on AWS.**
+
+**Use it when:**
+- You have a standard REST API, backend service, or microservice
+- Your team does not have a dedicated DevOps engineer
+- Traffic is variable and you want auto-scaling without managing servers
+- You want to pay only for what actually runs
+
+**Real-world examples:** Most startups, SaaS products, REST APIs, background services.
+
+---
+
+### Option 5 — App Runner
+
+**What it is:** ECS Fargate with everything pre-configured. Point at an ECR image, get a public HTTPS URL in minutes.
+
+**Used in production?** Yes, for the right use cases.
+
+**Use it when:**
+- Internal tools, admin panels, or low-to-medium traffic APIs
+- No DevOps engineer on the team
+- Speed of deployment matters more than cost optimization
+- Personal and side projects that still need a real HTTPS endpoint
+
+**Do not use it when:**
+- You need complex private VPC networking
+- Traffic is high and cost efficiency matters
+- You need fine-grained control over scaling
+
+---
+
+### Option 6 — EKS (Kubernetes on AWS)
+
+**What it is:** AWS-managed Kubernetes cluster. A full container orchestration platform for running many services at scale.
+
+**Used in production?** Yes — at large scale.
+
+**Use it when:**
+- You have 10+ microservices that need to communicate with each other
+- You need advanced traffic management (canary deployments, blue/green, circuit breakers)
+- You want multi-cloud portability — the same Kubernetes config works on GCP, Azure, and on-premise
+- Your company has a dedicated Platform Engineering or DevOps team
+
+**Do not use it when:** You only have one or two services. Kubernetes has serious operational overhead and a steep learning curve.
+
+**Real-world examples:** Netflix, Airbnb, large enterprises, companies with 50+ engineers.
+
+---
+
+### Bonus — AWS Lambda (Serverless Functions)
+
+Lambda is fundamentally different from all of the above. There is no container to manage and no server that stays running. Your function runs only when triggered, then shuts down completely. You pay per invocation — zero cost when idle.
+
+**Use it for:**
+- Processing files when uploaded to S3 (resize an image, parse a CSV)
+- Webhook receivers (GitHub, Stripe, Slack webhooks)
+- Scheduled background jobs (cron-like tasks)
+- Event-driven processing triggered by SQS, SNS, or DynamoDB
+
+**Do not use it for:**
+- Long-running processes
+- Streaming HTTP responses (like Server-Sent Events)
+- WebSockets
+- Latency-sensitive APIs (Lambda has a cold start delay on first invocation after being idle)
+
+---
+
+### The Full Decision Table
+
+| Scenario | Use This |
+|---|---|
+| Learning or personal project | EC2 or App Runner |
+| MVP or startup with 1–3 services | **ECS Fargate** |
+| Traditional code deploy, no Docker, quick setup | **Elastic Beanstalk** |
+| Simple API, small team, just needs to work | **App Runner** |
+| Standard production microservices (with Docker) | **ECS Fargate** |
+| 10+ services, dedicated infra team | **EKS (Kubernetes)** |
+| Containers that need GPU (ML inference) | ECS on EC2 |
+| Multi-cloud or cloud portability required | **EKS** |
+| Event-driven, short-lived background tasks | **Lambda** |
+| Static website or React frontend | **S3 + CloudFront** |
+
+---
+
+### Recommended Setup for a Typical Python/FastAPI Web App
+
+| App Component | Recommendation | Why |
+|---|---|---|
+| **FastAPI backend** | **ECS Fargate** | Stays running, handles HTTP, supports streaming responses, scales automatically |
+| **React frontend** | **S3 + CloudFront** | Static files need no server — S3 is near-free, CloudFront delivers files fast globally |
+| **Background jobs** | **Lambda** | Event-driven tasks (send email, process an upload) run only when needed — zero idle cost |
+| **Future: 10+ services** | **EKS** | Only when your architecture genuinely requires Kubernetes-level orchestration |
+
+> **Bottom line:** Use **ECS Fargate** for your backend and **S3 + CloudFront** for your frontend. This is the standard production setup used by the majority of companies on AWS. Graduate to EKS only when the scale and complexity of your system genuinely requires it.
 
 ---
 
