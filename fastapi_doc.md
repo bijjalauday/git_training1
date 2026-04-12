@@ -29,6 +29,7 @@
 20. [Async & Await in FastAPI](#20-async--await-in-fastapi)
 21. [Testing FastAPI Applications](#21-testing-fastapi-applications)
 22. [Project Structure Best Practices](#22-project-structure-best-practices)
+23. [SSO Authentication with Auth0 (Frontend + Backend)](#23-sso-authentication-with-auth0-frontend--backend)
 
 ---
 
@@ -1559,3 +1560,683 @@ from pydantic import BaseModel, Field, EmailStr
 ---
 
 *Documentation written for FastAPI beginners to intermediate developers | April 2026*
+
+---
+
+## 23. SSO Authentication with Auth0 (Frontend + Backend)
+
+SSO (Single Sign-On) lets users log in **once** using a trusted provider (Auth0, Google, GitHub, Microsoft) and access your application without you managing passwords yourself.
+
+This section explains how Auth0 SSO works end-to-end across your **React frontend** and **FastAPI backend**.
+
+---
+
+### Key Concepts Before the Code
+
+| Concept | Simple Meaning |
+|---|---|
+| **Client ID** | Identity card of your React app — tells Auth0 which app is asking for login |
+| **Domain** | Address of your Auth0 instance e.g. `dev-xyz.us.auth0.com` |
+| **Audience** | Which backend API the token is for e.g. `https://localhost:8000` |
+| **Callback URL** | Where Auth0 sends the user back after login e.g. `http://localhost:5173/callback` |
+| **JWT Token** | A signed proof-of-login that the frontend sends to the backend on every request |
+| **JWKS** | Auth0's public keys — used by the backend to verify the JWT was genuinely signed by Auth0 |
+
+---
+
+### How the Complete Flow Works
+
+```
+1. User clicks "Sign In" in React app
+         ↓
+2. React redirects browser to Auth0 login page
+   (sends: client_id, redirect_uri, audience)
+         ↓
+3. User enters credentials on Auth0's page
+         ↓
+4. Auth0 verifies credentials
+         ↓
+5. Auth0 redirects back to: http://localhost:5173/callback?code=TEMP_CODE
+         ↓
+6. @auth0/auth0-react library exchanges the code for a real JWT token
+   (background HTTP call — token never appears in the URL)
+         ↓
+7. React stores the JWT token in memory
+         ↓
+8. User sends a chat message → React calls:
+   POST /api/v1/chat/completions
+   Authorization: Bearer eyJhbGci...
+         ↓
+9. FastAPI verifies the JWT:
+   - Fetches Auth0 public keys (JWKS)
+   - Checks signature, audience, issuer, expiry
+         ↓
+10. All valid → calls OpenAI → returns response
+    Invalid  → returns 401 Unauthorized
+```
+
+> **Why the two-step code exchange?**  
+> Auth0 gives a short-lived temporary code first (not the real token). The real token is fetched via a background HTTP call. This keeps the token out of the browser URL, history, and logs — much more secure.
+
+---
+
+### Install Required Packages
+
+**Backend:**
+```bash
+pip install python-jose[cryptography] httpx
+```
+
+**Frontend:**
+```bash
+npm install @auth0/auth0-react
+```
+
+---
+
+### Project Structure
+
+```
+backend/
+└── app/
+    ├── core/
+    │   ├── config.py       ← Auth0 settings loaded from .env
+    │   └── security.py     ← JWT verification logic
+    └── routes/
+        └── chat.py         ← Protected route using Depends(verify_token)
+
+frontend/
+└── src/
+    ├── main.jsx            ← Auth0Provider wraps the whole app
+    ├── App.jsx             ← Login gate — shows login screen if not authenticated
+    ├── components/
+    │   └── GptChat.jsx     ← Gets token, shows logout button
+    └── services/
+        └── api.js          ← Sends Authorization: Bearer <token> on every request
+```
+
+---
+
+### Backend — Step 1: Add Auth0 Settings to Config
+
+**`.env` file:**
+```
+AUTH0_DOMAIN=dev-yourtenantid.us.auth0.com
+AUTH0_AUDIENCE=https://localhost:8000
+AUTH0_CLIENT_ID=your-client-id-here
+```
+
+**`app/core/config.py`:**
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Auth0
+    auth0_domain: str = ""
+    auth0_audience: str = ""
+    auth0_client_id: str = ""
+
+    # OpenAI
+    openai_api_key: str = ""
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+```
+
+The `@lru_cache` ensures settings are read from `.env` **only once** at startup and cached for all subsequent calls.
+
+---
+
+### Backend — Step 2: JWT Verification (`security.py`)
+
+This is the **core of the auth system**. Every incoming request to a protected route passes through this code.
+
+```python
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict
+
+import httpx
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+
+from app.core.config import get_settings
+
+logger = logging.getLogger("app.security")
+
+# ── Step A: Doorman ───────────────────────────────────────────────────────────
+# Tells FastAPI to look for: Authorization: Bearer <token> in every request
+# If the header is missing → FastAPI returns 403 automatically before your code runs
+bearing_scheme = HTTPBearer()
+
+# ── Step B: JWKS Cache ────────────────────────────────────────────────────────
+# Stores Auth0's public keys in memory after first fetch
+# Without this, every request would call Auth0's server — slow and unnecessary
+_jwks_cache: Dict[str, Any] = {}
+
+
+async def _get_jwks() -> Dict[str, Any]:
+    """
+    Fetch Auth0's public keys from:
+    https://<your-domain>/.well-known/jwks.json
+
+    These keys are used to verify that the JWT was genuinely signed by Auth0.
+    Cached after first fetch — Auth0 keys almost never change.
+    """
+    global _jwks_cache
+    if _jwks_cache:           # Already fetched? Return immediately from memory
+        return _jwks_cache
+
+    settings = get_settings()
+    jwks_url = f"https://{settings.auth0_domain}/.well-known/jwks.json"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(jwks_url, timeout=10)
+        response.raise_for_status()
+        _jwks_cache = response.json()   # Store: {"keys": [{"kid": "abc", "n": "...", "e": "AQAB", ...}]}
+
+    return _jwks_cache
+
+
+# ── Step C: verify_token — The Main Guard ─────────────────────────────────────
+async def verify_token(
+    credentials: HTTPAuthorizationCredentials = Depends(bearing_scheme),
+) -> Dict[str, Any]:
+    """
+    FastAPI dependency — runs before any protected route handler.
+    
+    What it does:
+    1. Extracts the raw JWT string from the Authorization header
+    2. Reads the token header to find which Auth0 key was used to sign it
+    3. Finds that key from the JWKS cache
+    4. Verifies: signature + audience + issuer + expiry
+    5. Returns the decoded token payload (user info) on success
+    6. Raises HTTP 401 on any failure
+    """
+    token = credentials.credentials   # raw JWT string: "eyJhbGci..."
+    settings = get_settings()
+
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        # 1. Fetch cached public keys from Auth0
+        jwks = await _get_jwks()
+
+        # 2. Read token header WITHOUT verifying yet
+        #    Header contains: {"alg": "RS256", "kid": "abc123", "typ": "JWT"}
+        #    "kid" = Key ID — tells us which of Auth0's keys signed this token
+        unverified_header = jwt.get_unverified_header(token)
+
+        # 3. Find the matching public key from Auth0's JWKS
+        #    Auth0 may have multiple keys — match by kid
+        rsa_key = {}
+        for key in jwks.get("keys", []):
+            if key["kid"] == unverified_header.get("kid"):
+                rsa_key = {
+                    "kty": key["kty"],   # Key type: RSA
+                    "kid": key["kid"],   # Key ID
+                    "use": key["use"],   # Usage: sig (signing)
+                    "n":   key["n"],     # RSA modulus (large number)
+                    "e":   key["e"],     # RSA exponent
+                }
+                break
+
+        if not rsa_key:
+            logger.warning("No matching RSA key found for kid=%s", unverified_header.get("kid"))
+            raise credentials_error
+
+        # 4. Verify and decode the JWT — all 4 checks happen here:
+        #    ✓ Signature  — was this signed by Auth0's private key?
+        #    ✓ Audience   — is aud == auth0_audience (your API)?
+        #    ✓ Issuer     — is iss == your Auth0 domain?
+        #    ✓ Expiry     — is the token still within its validity window?
+        payload = jwt.decode(
+            token,
+            rsa_key,
+            algorithms=["RS256"],
+            audience=settings.auth0_audience,
+            issuer=f"https://{settings.auth0_domain}/",
+        )
+
+        # 5. Return the decoded payload — available as `user` in your route
+        # {
+        #   "sub": "google-oauth2|123456789",   ← user's unique ID
+        #   "aud": "https://localhost:8000",
+        #   "iss": "https://dev-xyz.us.auth0.com/",
+        #   "exp": 1744329600,                  ← expiry timestamp
+        #   "email": "user@example.com"
+        # }
+        return payload
+
+    except JWTError as exc:
+        # Token is invalid, expired, tampered, or has wrong audience/issuer
+        logger.warning("JWT validation failed: %s", exc)
+        raise credentials_error from exc
+
+    except httpx.HTTPError as exc:
+        # Auth0 was unreachable when fetching JWKS
+        logger.error("Failed to fetch JWKS from Auth0: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service unavailable",
+        ) from exc
+```
+
+---
+
+### Backend — Step 3: Protect a Route
+
+Add `Depends(verify_token)` to any route you want to protect:
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Any, Dict
+from app.core.security import verify_token
+from app.schemas.chat import ChatRequest, ChatResponse
+from app.services.openai_service import complete_chat
+
+router = APIRouter(prefix="/chat", tags=["Chat"])
+
+@router.post("/completions", response_model=ChatResponse)
+async def chat_completions(
+    request: ChatRequest,
+    user: Dict[str, Any] = Depends(verify_token),   # ← Auth guard
+):
+    """
+    How the `user` parameter works:
+    - FastAPI sees Depends(verify_token)
+    - Before running this function, it runs verify_token()
+    - verify_token() extracts + validates the JWT from the Authorization header
+    - If valid  → returns the decoded token payload as `user`
+    - If invalid → raises 401 before this function even runs
+    """
+    logger.debug("Request from user sub=%s", user.get("sub"))
+
+    try:
+        result = await complete_chat(request)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}")
+
+    return result
+```
+
+**What happens on each request:**
+```
+Request arrives
+      ↓
+HTTPBearer extracts token from Authorization header
+      ↓
+verify_token() runs (validates JWT)
+      ↓
+Valid?  → chat_completions() runs → OpenAI called → response returned
+Invalid? → 401 returned immediately — OpenAI never called
+```
+
+---
+
+### Frontend — Step 1: Wrap the App in Auth0Provider
+
+**`src/main.jsx`:**
+```jsx
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import { Auth0Provider } from '@auth0/auth0-react'
+import App from './App.jsx'
+import './index.css'
+
+// These come from your .env file
+const domain   = import.meta.env.VITE_AUTH0_DOMAIN
+const clientId = import.meta.env.VITE_AUTH0_CLIENT_ID
+const audience = import.meta.env.VITE_AUTH0_AUDIENCE
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    {/*
+      Auth0Provider wraps the ENTIRE app.
+      This makes Auth0 hooks (useAuth0) available in every component.
+
+      domain      → where Auth0 is located
+      clientId    → which app is this (your React app's identity card)
+      redirect_uri → where to send the user after login
+      audience    → which backend API the token should be issued for
+    */}
+    <Auth0Provider
+      domain={domain}
+      clientId={clientId}
+      authorizationParams={{
+        redirect_uri: `${window.location.origin}/callback`,
+        audience,
+      }}
+    >
+      <App />
+    </Auth0Provider>
+  </React.StrictMode>,
+)
+```
+
+---
+
+### Frontend — Step 2: Login Gate in App.jsx
+
+**`src/App.jsx`:**
+```jsx
+import { useAuth0 } from '@auth0/auth0-react'
+import GptChat from './components/GptChat'
+
+function App() {
+  // useAuth0 gives us:
+  // isLoading      → true while Auth0 is checking if the user is already logged in
+  // isAuthenticated → true if the user has a valid session
+  // loginWithRedirect → function that redirects to Auth0's login page
+  const { isLoading, isAuthenticated, loginWithRedirect } = useAuth0()
+
+  // While Auth0 is checking session (brief moment on page load)
+  if (isLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <span>Loading...</span>
+      </div>
+    )
+  }
+
+  // User is not logged in → show login screen
+  // The whole chat app is HIDDEN until authenticated
+  if (!isAuthenticated) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <div>
+          <h1>My GPT AI</h1>
+          <p>Sign in to start chatting</p>
+          <button onClick={() => loginWithRedirect()}>
+            Sign in with Auth0
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // User is authenticated → show the chat app
+  return <GptChat />
+}
+
+export default App
+```
+
+**What happens when user clicks "Sign in with Auth0":**
+```
+loginWithRedirect() called
+      ↓
+Browser goes to: https://dev-xyz.us.auth0.com/authorize
+                 ?client_id=KVdyn...
+                 &redirect_uri=http://localhost:5173/callback
+                 &audience=https://localhost:8000
+                 &response_type=code
+      ↓
+User enters credentials on Auth0 page
+      ↓
+Auth0 redirects to: http://localhost:5173/callback?code=TEMP_CODE
+      ↓
+@auth0/auth0-react exchanges code → gets real JWT token
+      ↓
+isAuthenticated becomes true → GptChat renders
+```
+
+---
+
+### Frontend — Step 3: Get Token and Send It to the Backend
+
+**`src/components/GptChat.jsx` (relevant parts):**
+```jsx
+import { useAuth0 } from '@auth0/auth0-react'
+
+export default function GptChat() {
+  // getAccessTokenSilently → fetches the JWT token
+  //   - First call: exchanges the code with Auth0 → gets a token
+  //   - Subsequent calls: returns cached token from memory
+  //   - When token expires: silently refreshes it using a refresh token
+  //   - You never manage token expiry yourself
+  const { user, logout, getAccessTokenSilently } = useAuth0()
+
+  const handleSend = async () => {
+    // 1. Get the JWT token before calling the backend
+    let token = ''
+    try {
+      token = await getAccessTokenSilently({
+        authorizationParams: {
+          audience: import.meta.env.VITE_AUTH0_AUDIENCE  // "https://localhost:8000"
+        }
+      })
+    } catch (err) {
+      setErrorMsg('Session expired — please sign in again')
+      return
+    }
+
+    // 2. Pass token to API call
+    await sendChatStream({
+      messages,
+      model: selectedModel,
+      temperature,
+      maxTokens,
+      token,     // ← passed here
+      onDelta: (delta) => { /* update UI */ },
+      onDone: () => { /* finished */ },
+      onError: (err) => { setErrorMsg(err) },
+    })
+  }
+
+  // Logout button — clears session and redirects to home
+  return (
+    <button onClick={() => logout({ logoutParams: { returnTo: window.location.origin } })}>
+      Sign out
+    </button>
+  )
+}
+```
+
+---
+
+### Frontend — Step 4: Add Token to Every API Call
+
+**`src/services/api.js`:**
+```javascript
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1'
+
+// Non-streaming request
+export async function sendChatCompletion({ messages, model, temperature, maxTokens, systemPrompt, token }) {
+  const response = await fetch(`${API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`,   // ← JWT sent here
+    },
+    body: JSON.stringify({
+      messages,
+      model,
+      temperature,
+      max_tokens: maxTokens,
+      system_prompt: systemPrompt || null,
+      stream: false,
+    }),
+  })
+
+  if (!response.ok) {
+    // 401 → token invalid/expired
+    // 502 → OpenAI error
+    const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }))
+    throw new Error(errorData.detail || `HTTP ${response.status}`)
+  }
+
+  const data = await response.json()
+  return data.content
+}
+
+// Streaming request (SSE)
+export async function sendChatStream({ messages, model, temperature, maxTokens, systemPrompt, token, onDelta, onDone, onError }) {
+  try {
+    const response = await fetch(`${API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,   // ← JWT sent here too
+      },
+      body: JSON.stringify({
+        messages,
+        model,
+        temperature,
+        max_tokens: maxTokens,
+        system_prompt: systemPrompt || null,
+        stream: true,
+      }),
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }))
+      throw new Error(errorData.detail || `HTTP ${response.status}`)
+    }
+
+    // Read the SSE stream chunk by chunk
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop()
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed.startsWith('data:')) continue
+        const raw = trimmed.slice(5).trim()
+        if (raw === '[DONE]') { onDone(); return }
+        const parsed = JSON.parse(raw)
+        if (parsed.delta) onDelta(parsed.delta)
+      }
+    }
+    onDone()
+  } catch (err) {
+    onError(err.message || 'Network error')
+  }
+}
+```
+
+---
+
+### Frontend `.env` File
+
+```
+# Vite env vars — must start with VITE_ to be accessible in the browser
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+VITE_AUTH0_DOMAIN=dev-yourtenantid.us.auth0.com
+VITE_AUTH0_CLIENT_ID=your-client-id-here
+VITE_AUTH0_AUDIENCE=https://localhost:8000
+```
+
+> **Important:** Never put secret keys in the frontend `.env`. Client ID and Domain are safe to expose — they are public identifiers, not secrets.
+
+---
+
+### What Happens on Every Protected API Call — End to End
+
+```
+User types a message and clicks Send
+      ↓
+GptChat.jsx calls getAccessTokenSilently()
+  → Returns cached JWT (or silently refreshes if expired)
+      ↓
+api.js sends:
+  POST http://localhost:8000/api/v1/chat/completions
+  Headers: {
+    Content-Type: application/json
+    Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+  }
+  Body: { messages: [...], model: "gpt-3.5-turbo", ... }
+      ↓
+FastAPI receives the request
+  → HTTPBearer extracts: "eyJhbGciOiJSUzI1NiJ9..."
+  → Depends(verify_token) runs:
+      1. Fetch JWKS from Auth0 (or use cache)
+      2. jwt.get_unverified_header() → find kid
+      3. Match kid to rsa_key in JWKS
+      4. jwt.decode() → verify signature, audience, issuer, expiry
+      ↓
+  Valid?  → payload = {"sub": "user-id", "email": "...", ...}
+           → chat_completions() runs
+           → OpenAI API called
+           → response streamed back to frontend
+  Invalid? → HTTP 401 Unauthorized returned
+           → Frontend shows error banner
+```
+
+---
+
+### Auth0 Dashboard Configuration Checklist
+
+Before running the app, verify these settings in the Auth0 dashboard:
+
+| Setting | Value |
+|---|---|
+| **Application Type** | Single Page Application |
+| **Allowed Callback URLs** | `http://localhost:5173/callback` |
+| **Allowed Logout URLs** | `http://localhost:5173` |
+| **Allowed Web Origins** | `http://localhost:5173` |
+| **API Identifier (Audience)** | `https://localhost:8000` |
+
+When deploying to production, add your production URLs alongside the localhost ones:
+```
+Allowed Callback URLs:
+  http://localhost:5173/callback,
+  https://yourdomain.com/callback
+```
+
+---
+
+### Common Errors and Fixes
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Callback URL mismatch` | `redirect_uri` not in Auth0 allowed list | Add the exact URL to Allowed Callback URLs in Auth0 dashboard |
+| `HTTP 401 Unauthorized` | Token missing, expired, or wrong audience | Check `VITE_AUTH0_AUDIENCE` matches the API Identifier in Auth0 |
+| `error parsing cors_origins` | List field in `.env` not in JSON format | Use: `CORS_ORIGINS=["http://localhost:5173"]` |
+| `text_stream AttributeError` | Old openai SDK helper not available | Use `stream=True` on `create()` and iterate `chunk.choices[0].delta.content` |
+| `No matching RSA key` | Token signed with a rotated key | Clear `_jwks_cache` and restart server — it will re-fetch fresh keys |
+
+---
+
+### Quick Reference: SSO with Auth0
+
+```python
+# Backend — protect a route
+from app.core.security import verify_token
+from fastapi import Depends
+
+@router.post("/protected")
+async def protected_route(user=Depends(verify_token)):
+    return {"message": f"Hello {user['sub']}"}
+```
+
+```jsx
+// Frontend — get token and call backend
+import { useAuth0 } from '@auth0/auth0-react'
+
+const { getAccessTokenSilently, logout, user } = useAuth0()
+const token = await getAccessTokenSilently({ authorizationParams: { audience } })
+
+// Send token in every request
+fetch('/api/v1/protected', {
+  headers: { Authorization: `Bearer ${token}` }
+})
+```
